@@ -226,46 +226,51 @@ def chat():
 
     # Retrieve relevant context from dataset
     pairs = retrieve_top_k(user_message, K)  # [(idx, sim), ...]
-    # Debug: inspect top similarities
-    if pairs:
-        print("[RET] top sims:", [round(s, 3) for _, s in pairs][:5])
-    else:
-        print("[RET] no matches; falling back")
     valid_pairs = [(i, s) for (i, s) in pairs if s >= MIN_SIM]
     use_dataset = len(valid_pairs) > 0
 
     if use_dataset:
-    context_blocks = [_display_blobs[idx] for idx, _ in valid_pairs]
-    context_text = "\n\n---\n\n".join([b for b in context_blocks if b.strip()])
+        # Build CONTEXT from valid matches
+        context_blocks = [_display_blobs[idx] for idx, _ in valid_pairs]
+        context_text = "\n\n---\n\n".join([b for b in context_blocks if b.strip()])
 
-    system_hint = (
-        "You are a helpful health assistant. Answer the user using ONLY the information in the CONTEXT. "
-        "If the answer is not in the CONTEXT, say: 'I don't know based on the provided data.' "
-        "Do not fabricate details."
-    )
-    grounded_prompt = f"{system_hint}\n\nCONTEXT:\n{context_text}\n\nUser: {user_message}\nAnswer:"
+        system_hint = (
+            "You are a helpful health assistant. Answer the user using ONLY the information in the CONTEXT. "
+            "If the answer is not in the CONTEXT, say: 'I don't know based on the provided data.' "
+            "Do not fabricate details."
+        )
+        grounded_prompt = f"{system_hint}\n\nCONTEXT:\n{context_text}\n\nUser: {user_message}\nAnswer:"
 
-    try:
-        chat_session = model.start_chat(history=history)
-        response = chat_session.send_message(grounded_prompt)
-        bot_reply = getattr(response, "text", "") or ""
-    except Exception as e:
-        bot_reply = f"Error: {e}"
-
-    # --- NEW: if the dataset-based reply says it doesn't know, do open Gemini fallback ---
-    normalized = bot_reply.lower().strip()
-    if (
-        "i don't know based on the provided data" in normalized
-        or normalized in {"i don't know.", "i don't know", "idk"}
-        or len(normalized) < 8
-    ):
         try:
-            response2 = chat_session.send_message(user_message)
-            gen_reply = getattr(response2, "text", "") or "Sorry, I couldn't generate a response."
+            chat_session = model.start_chat(history=history)
+            response = chat_session.send_message(grounded_prompt)
+            bot_reply = getattr(response, "text", "") or ""
+        except Exception as e:
+            bot_reply = f"Error: {e}"
+
+        # If the dataset-based reply still doesn't have an answer, fall back to open Gemini
+        normalized = bot_reply.lower().strip()
+        if (
+            "i don't know based on the provided data" in normalized
+            or normalized in {"i don't know.", "i don't know", "idk"}
+            or len(normalized) < 8
+        ):
+            try:
+                response2 = chat_session.send_message(user_message)
+                gen_reply = getattr(response2, "text", "") or "Sorry, I couldn't generate a response."
+            except Exception as e:
+                gen_reply = f"Error: {e}"
+            bot_reply = f"{FALLBACK_PREFIX}\n\n{gen_reply}"
+
+    else:
+        # Fallback to open Gemini answer (still keep memory)
+        try:
+            chat_session = model.start_chat(history=history)
+            response = chat_session.send_message(user_message)
+            gen_reply = getattr(response, "text", "") or "Sorry, I couldn't generate a response."
         except Exception as e:
             gen_reply = f"Error: {e}"
         bot_reply = f"{FALLBACK_PREFIX}\n\n{gen_reply}"
-
 
     # Update session history (trim to last N messages)
     history.append({"role": "user", "parts": [user_message]})
@@ -273,7 +278,6 @@ def chat():
     session["history"] = history[-MAX_HISTORY:]
 
     return jsonify({"response": bot_reply})
-
 
 @app.route("/reset", methods=["POST"])
 def reset():
