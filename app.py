@@ -64,7 +64,7 @@ def _item_to_text_blob(item: Dict) -> str:
     """Build a searchable text blob from many possible schemas."""
     if isinstance(item, dict):
         preferred_keys = [
-            "question", "q", "prompt", "title", "heading", "query",
+            "question", "q", "prompt", "title", "heading", "query", "input", "output",
             "answer", "a", "response", "content", "text", "body", "description", "context"
         ]
         parts = []
@@ -107,12 +107,12 @@ def _rows_from_csv(path: str) -> List[Dict]:
     a_col = CSV_A_COL.lower() if CSV_A_COL else None
 
     if not q_col:
-        for cand in ["question", "q", "prompt", "title", "query"]:
+        for cand in ["question", "q", "prompt", "title", "query", "input"]:
             if cand in df.columns:
                 q_col = cand
                 break
     if not a_col:
-        for cand in ["answer", "a", "response", "content", "text", "reply"]:
+        for cand in ["answer", "a", "response", "content", "text", "reply", "output"]:
             if cand in df.columns:
                 a_col = cand
                 break
@@ -235,7 +235,7 @@ def chat():
         context_text = "\n\n---\n\n".join([b for b in context_blocks if b.strip()])
 
         system_hint = (
-            "You are a helpful assistant. Answer the user using ONLY the information in the CONTEXT. "
+            "You are a helpful health assistant. Answer the user using ONLY the information in the CONTEXT. "
             "If the answer is not in the CONTEXT, say: 'I don't know based on the provided data.' "
             "Do not fabricate details."
         )
