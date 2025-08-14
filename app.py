@@ -43,10 +43,6 @@ def translate(text: str, src_lang: str, dest_lang: str) -> str:
 # Retrieval settings
 K = int(os.getenv("K", "3"))  # how many top items to include as context
 MIN_SIM = float(os.getenv("MIN_SIM", "0.05"))  # similarity threshold (0.00–1.00)
-FALLBACK_PREFIX = os.getenv(
-    "FALLBACK_PREFIX",
-    "This question isn’t covered by the provided data, but here’s an answer from Gemini:"
-)
 
 # Dataset locations
 # Use DATA_GLOB to load multiple CSVs (e.g., data/*.csv), or DATA_PATH for a single file (csv or json).
@@ -292,16 +288,20 @@ def chat():
             bot_reply = translate(bot_reply_en, src_lang="en", dest_lang=user_lang)
 
     else:
-        # No good matches → fallback to open Gemini (in English), then translate back
+        # Fallback to open Gemini answer (still keep memory)
         try:
             chat_session = model.start_chat(history=history)
             response = chat_session.send_message(user_message_en)
-            gen_reply_en = getattr(response, "text", "") or "Sorry, I couldn't generate a response."
+            gen_reply_en = getattr(response, "text", None) or "Sorry, I couldn't generate a response."
         except Exception as e:
             gen_reply_en = f"Error: {e}"
 
-        prefix_local = translate(FALLBACK_PREFIX, src_lang="en", dest_lang=user_lang)
-        bot_reply = f"{prefix_local}\n\n{translate(gen_reply_en, src_lang='en', dest_lang=user_lang)}"
+        # Translate back to user language
+        gen_reply_local = translate(gen_reply_en, src_lang="en", dest_lang=user_lang)
+
+        # Append signature instead of prefix
+        bot_reply = f"{gen_reply_local}\n\n– Gemini"
+
 
     # Update session history (store the original user message and the localized reply)
     history.append({"role": "user", "parts": [user_message]})
