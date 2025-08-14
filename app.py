@@ -39,7 +39,6 @@ def _item_to_text_blob(item):
     return str(item)
 
 def _item_to_context_block(item):
-    """Build a clean, human-readable block for Gemini to see."""
     if isinstance(item, dict):
         q = item.get("question") or item.get("q") or item.get("title") or ""
         a = item.get("answer") or item.get("a") or item.get("response") or item.get("content") or item.get("text") or ""
