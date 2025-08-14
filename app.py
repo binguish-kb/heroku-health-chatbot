@@ -14,11 +14,11 @@ from sklearn.metrics.pairwise import cosine_similarity
 # =========================
 # Configuration (env vars)
 # =========================
-GEMINI_API_KEY = os.getenv("AIzaSyDyA8IBM5H6ih7irppMvA0ctfdnbql8OjM")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 # Session + memory
-SECRET_KEY = os.getenv("SECRET_KEY", "9f4c68f79e1a4d89aab72e92398cb3651f71eaf93a6b0f9fbc5f83dc0e3a6d2e")
+SECRET_KEY = os.getenv("SECRET_KEY")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))  # total messages kept (user+bot), 10 ~= last 5 exchanges
 
 # Retrieval settings
