@@ -2,6 +2,9 @@ import os
 import json
 import glob
 from typing import List, Dict, Tuple
+from langdetect import detect
+from deep_translator import GoogleTranslator
+
 
 from flask import Flask, render_template, request, jsonify, session
 import google.generativeai as genai
@@ -21,6 +24,22 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 SECRET_KEY = os.getenv("SECRET_KEY")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))  # total messages kept (user+bot), 10 ~= last 5 exchanges
 
+def detect_lang(text: str, default="en") -> str:
+    try:
+        lang = detect(text)
+        return lang or default
+    except Exception:
+        return default
+
+def translate(text: str, src_lang: str, dest_lang: str) -> str:
+    if not text or src_lang == dest_lang:
+        return text
+    try:
+        return GoogleTranslator(source=src_lang, target=dest_lang).translate(text)
+    except Exception:
+        # If translation fails, just return original so the app still replies
+        return text
+        
 # Retrieval settings
 K = int(os.getenv("K", "3"))  # how many top items to include as context
 MIN_SIM = float(os.getenv("MIN_SIM", "0.05"))  # similarity threshold (0.00–1.00)
@@ -221,63 +240,76 @@ def chat():
     if not user_message:
         return jsonify({"response": "Please type a message."}), 400
 
+    # Detect user language (default English)
+    user_lang = detect_lang(user_message, default="en")
+
+    # Translate user message to English for retrieval (assuming your CSVs are English)
+    user_message_en = translate(user_message, src_lang=user_lang, dest_lang="en")
+
     # Short-term history from session
     history = session.get("history", [])
 
-    # Retrieve relevant context from dataset
-    pairs = retrieve_top_k(user_message, K)  # [(idx, sim), ...]
+    # Retrieve relevant context from dataset using the English version
+    pairs = retrieve_top_k(user_message_en, K)  # [(idx, sim), ...]
     valid_pairs = [(i, s) for (i, s) in pairs if s >= MIN_SIM]
     use_dataset = len(valid_pairs) > 0
 
     if use_dataset:
-        # Build CONTEXT from valid matches
+        # Build CONTEXT from valid matches (these are English snippets)
         context_blocks = [_display_blobs[idx] for idx, _ in valid_pairs]
-        context_text = "\n\n---\n\n".join([b for b in context_blocks if b.strip()])
+        context_text_en = "\n\n---\n\n".join([b for b in context_blocks if b.strip()])
 
         system_hint = (
             "You are a helpful health assistant. Answer the user using ONLY the information in the CONTEXT. "
             "If the answer is not in the CONTEXT, say: 'I don't know based on the provided data.' "
             "Do not fabricate details."
         )
-        grounded_prompt = f"{system_hint}\n\nCONTEXT:\n{context_text}\n\nUser: {user_message}\nAnswer:"
+        grounded_prompt_en = f"{system_hint}\n\nCONTEXT:\n{context_text_en}\n\nUser: {user_message_en}\nAnswer:"
 
         try:
             chat_session = model.start_chat(history=history)
-            response = chat_session.send_message(grounded_prompt)
-            bot_reply = getattr(response, "text", "") or ""
+            response = chat_session.send_message(grounded_prompt_en)
+            bot_reply_en = getattr(response, "text", "") or ""
         except Exception as e:
-            bot_reply = f"Error: {e}"
+            bot_reply_en = f"Error: {e}"
 
-        # If the dataset-based reply still doesn't have an answer, fall back to open Gemini
-        normalized = bot_reply.lower().strip()
+        # If dataset-based reply still doesn't answer, fall back to open Gemini
+        normalized = bot_reply_en.lower().strip()
         if (
             "i don't know based on the provided data" in normalized
             or normalized in {"i don't know.", "i don't know", "idk"}
             or len(normalized) < 8
         ):
             try:
-                response2 = chat_session.send_message(user_message)
-                gen_reply = getattr(response2, "text", "") or "Sorry, I couldn't generate a response."
+                response2 = chat_session.send_message(user_message_en)
+                gen_reply_en = getattr(response2, "text", "") or "Sorry, I couldn't generate a response."
             except Exception as e:
-                gen_reply = f"Error: {e}"
-            bot_reply = f"{FALLBACK_PREFIX}\n\n{gen_reply}"
+                gen_reply_en = f"Error: {e}"
+            prefix_local = translate(FALLBACK_PREFIX, src_lang="en", dest_lang=user_lang)
+            bot_reply = f"{prefix_local}\n\n{translate(gen_reply_en, src_lang='en', dest_lang=user_lang)}"
+        else:
+            # Translate final dataset-grounded answer back to the user's language
+            bot_reply = translate(bot_reply_en, src_lang="en", dest_lang=user_lang)
 
     else:
-        # Fallback to open Gemini answer (still keep memory)
+        # No good matches → fallback to open Gemini (in English), then translate back
         try:
             chat_session = model.start_chat(history=history)
-            response = chat_session.send_message(user_message)
-            gen_reply = getattr(response, "text", "") or "Sorry, I couldn't generate a response."
+            response = chat_session.send_message(user_message_en)
+            gen_reply_en = getattr(response, "text", "") or "Sorry, I couldn't generate a response."
         except Exception as e:
-            gen_reply = f"Error: {e}"
-        bot_reply = f"{FALLBACK_PREFIX}\n\n{gen_reply}"
+            gen_reply_en = f"Error: {e}"
 
-    # Update session history (trim to last N messages)
+        prefix_local = translate(FALLBACK_PREFIX, src_lang="en", dest_lang=user_lang)
+        bot_reply = f"{prefix_local}\n\n{translate(gen_reply_en, src_lang='en', dest_lang=user_lang)}"
+
+    # Update session history (store the original user message and the localized reply)
     history.append({"role": "user", "parts": [user_message]})
     history.append({"role": "model", "parts": [bot_reply]})
     session["history"] = history[-MAX_HISTORY:]
 
     return jsonify({"response": bot_reply})
+
 
 @app.route("/reset", methods=["POST"])
 def reset():
