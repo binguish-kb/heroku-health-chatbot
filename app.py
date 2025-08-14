@@ -226,6 +226,11 @@ def chat():
 
     # Retrieve relevant context from dataset
     pairs = retrieve_top_k(user_message, K)  # [(idx, sim), ...]
+    # Debug: inspect top similarities
+    if pairs:
+        print("[RET] top sims:", [round(s, 3) for _, s in pairs][:5])
+    else:
+        print("[RET] no matches; falling back")
     valid_pairs = [(i, s) for (i, s) in pairs if s >= MIN_SIM]
     use_dataset = len(valid_pairs) > 0
 
