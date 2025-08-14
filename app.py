@@ -9,8 +9,7 @@ import google.generativeai as genai
 # --- Config ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-SECRET_KEY = os.getenv("SECRET_KEY", "9f4c68f79e1a4d89aab72e92398cb3651f71eaf93a6b0f9fbc5f83dc0e3a6d2e
-")
+SECRET_KEY = os.getenv("SECRET_KEY", "9f4c68f79e1a4d89aab72e92398cb3651f71eaf93a6b0f9fbc5f83dc0e3a6d2e")
 # Dataset config
 DATA_PATH = os.getenv("DATA_PATH", "no_gpu_limit_500 1.json")
 K = int(os.getenv("K", "3"))  # how many top matches to include as context
