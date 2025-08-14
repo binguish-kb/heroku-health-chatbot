@@ -1,3 +1,5 @@
 flask
 google-generativeai
 gunicorn
+numpy
+scikit-learn
