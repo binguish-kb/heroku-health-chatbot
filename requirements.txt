@@ -4,3 +4,5 @@ gunicorn
 numpy
 scikit-learn
 pandas
+langdetect
+deep-translator
