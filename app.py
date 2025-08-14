@@ -31,7 +31,7 @@ FALLBACK_PREFIX = os.getenv(
 
 # Dataset locations
 # Use DATA_GLOB to load multiple CSVs (e.g., data/*.csv), or DATA_PATH for a single file (csv or json).
-DATA_GLOB = os.getenv("DATA_GLOB", "data/*.csv")
+DATA_GLOB = os.getenv("DATA_GLOB", "*.csv")
 DATA_PATH = os.getenv("DATA_PATH", "")  # if set, takes priority over DATA_GLOB
 
 # Optional explicit CSV column hinting
