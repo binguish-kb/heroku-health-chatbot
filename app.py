@@ -1,10 +1,9 @@
 import os
 import json
 import glob
+import re
+import string
 from typing import List, Dict, Tuple
-from langdetect import detect
-from deep_translator import GoogleTranslator
-
 
 from flask import Flask, render_template, request, jsonify, session
 import google.generativeai as genai
@@ -14,61 +13,44 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+# ---- translation / language detection ----
+from langdetect import detect_langs
+from deep_translator import GoogleTranslator
+
 # =========================
 # Configuration (env vars)
 # =========================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 # Session + memory
-SECRET_KEY = os.getenv("SECRET_KEY")
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))  # total messages kept (user+bot), 10 ~= last 5 exchanges
+SECRET_KEY  = os.getenv("SECRET_KEY")
+MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))  # total (user+bot) messages kept
 
-TRANSLATION_ENABLED = os.getenv("TRANSLATION_ENABLED", "true").lower() in {"1","true","yes","on"}
-
-def detect_lang_confident(text: str, default="en", min_conf=0.80) -> str:
-    """Return ISO lang code if confident, else default ('en')."""
-    try:
-        # detect_langs returns list like ['en:0.99','es:0.01']
-        langs = detect_langs(text)
-        if not langs:
-            return default
-        top = langs[0]
-        # langdetect’s object formats like: Lang('en', 0.9999)
-        lang = top.lang
-        prob = getattr(top, 'prob', 0.0)
-        if lang == "en":
-            return "en"
-        return lang if prob >= min_conf else default
-    except Exception:
-        return default
-
-def translate(text: str, src_lang: str, dest_lang: str) -> str:
-    if not TRANSLATION_ENABLED or not text or src_lang == dest_lang:
-        return text
-    try:
-        return GoogleTranslator(source=src_lang, target=dest_lang).translate(text)
-    except Exception:
-        # If translation fails, return original so the bot still replies
-        return text
-
-        
 # Retrieval settings
-K = int(os.getenv("K", "3"))  # how many top items to include as context
-MIN_SIM = float(os.getenv("MIN_SIM", "0.05"))  # similarity threshold (0.00–1.00)
+K        = int(os.getenv("K", "3"))          # top-k context chunks
+MIN_SIM  = float(os.getenv("MIN_SIM", "0.05"))  # cosine similarity threshold
 
-# Dataset locations
-# Use DATA_GLOB to load multiple CSVs (e.g., data/*.csv), or DATA_PATH for a single file (csv or json).
+# Dataset locations (glob for many CSVs; DATA_PATH for one CSV/JSON)
 DATA_GLOB = os.getenv("DATA_GLOB", "*.csv")
-DATA_PATH = os.getenv("DATA_PATH", "")  # if set, takes priority over DATA_GLOB
+DATA_PATH = os.getenv("DATA_PATH", "")
 
 # Optional explicit CSV column hinting
-CSV_Q_COL = os.getenv("CSV_Q_COL", "")  # e.g., "question"
-CSV_A_COL = os.getenv("CSV_A_COL", "")  # e.g., "answer"
+CSV_Q_COL = os.getenv("CSV_Q_COL", "")  # e.g. "question"
+CSV_A_COL = os.getenv("CSV_A_COL", "")  # e.g. "answer"
 
-# Validate key
+# Multilingual toggles
+TRANSLATION_ENABLED = os.getenv("TRANSLATION_ENABLED", "true").lower() in {"1","true","yes","on"}
+MIN_DETECT_CONF     = float(os.getenv("MIN_DETECT_CONF", "0.80"))
+SHORT_MSG_LEN       = int(os.getenv("SHORT_MSG_LEN", "4"))    # <=N chars → treat as English
+FORCE_ENGLISH_ONLY  = os.getenv("FORCE_ENGLISH_ONLY", "false").lower() in {"1","true","yes","on"}
+
+# Validate critical keys
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set. Run: heroku config:set GEMINI_API_KEY=...")
+
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY is not set. Run: heroku config:set SECRET_KEY=...")
 
 # Flask app
 app = Flask(__name__)
@@ -84,6 +66,49 @@ _matrix = None
 _raw_items: List[Dict] = []
 _display_blobs: List[str] = []
 
+# =========================
+# Helpers: language / translation
+# =========================
+_EN_STOPWORDS = {
+    "the","be","to","of","and","a","in","that","have","i","it","for","not","on",
+    "with","he","as","you","do","at","this","but","his","by","from","we","they",
+    "say","her","she","or","an","will","my","one","all","would","there","their"
+}
+
+def looks_english(text: str) -> bool:
+    """Heuristic: short len → English; high ASCII ratio; >=2 English stopwords."""
+    if not text:
+        return True
+    if len(text.strip()) <= SHORT_MSG_LEN:
+        return True
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
+        return True
+    ascii_letters = [ch for ch in letters if ch in string.ascii_letters]
+    ascii_ratio = len(ascii_letters) / max(1, len(letters))
+    tokens = re.findall(r"[A-Za-z']+", text.lower())
+    hits = sum(1 for t in tokens if t in _EN_STOPWORDS)
+    return ascii_ratio >= 0.85 or hits >= 2
+
+def detect_lang_confident(text: str, default="en", min_conf=0.80) -> str:
+    try:
+        langs = detect_langs(text)  # e.g. [Lang('en', 0.9999)]
+        if not langs:
+            return default
+        top = langs[0]
+        lang = top.lang
+        prob = getattr(top, "prob", 0.0)
+        return lang if prob >= min_conf else default
+    except Exception:
+        return default
+
+def translate(text: str, src_lang: str, dest_lang: str) -> str:
+    if not TRANSLATION_ENABLED or not text or src_lang == dest_lang or FORCE_ENGLISH_ONLY:
+        return text
+    try:
+        return GoogleTranslator(source=src_lang, target=dest_lang).translate(text)
+    except Exception:
+        return text
 
 # =========================
 # Helpers: dataset shaping
@@ -91,12 +116,12 @@ _display_blobs: List[str] = []
 def _item_to_text_blob(item: Dict) -> str:
     """Build a searchable text blob from many possible schemas."""
     if isinstance(item, dict):
-        preferred_keys = [
+        preferred = [
             "question", "q", "prompt", "title", "heading", "query", "input", "output",
             "answer", "a", "response", "content", "text", "body", "description", "context"
         ]
         parts = []
-        for k in preferred_keys:
+        for k in preferred:
             if k in item and item[k] is not None:
                 parts.append(str(item[k]))
         if not parts:
@@ -104,7 +129,6 @@ def _item_to_text_blob(item: Dict) -> str:
         blob = " ".join(parts).strip()
         return blob if blob else json.dumps(item, ensure_ascii=False)
     return str(item)
-
 
 def _item_to_context_block(item: Dict) -> str:
     """Human-readable block that we show Gemini as CONTEXT."""
@@ -114,13 +138,10 @@ def _item_to_context_block(item: Dict) -> str:
     a = item.get("answer") or item.get("a") or item.get("response") or item.get("content") or item.get("text") or ""
     ctx = item.get("context") or item.get("description") or ""
     lines = []
-    if ctx:
-        lines.append(str(ctx))
-    if q or a:
-        lines.append(f"Q: {q}\nA: {a}")
+    if ctx: lines.append(str(ctx))
+    if q or a: lines.append(f"Q: {q}\nA: {a}")
     block = "\n".join([ln for ln in lines if ln.strip()])
     return block if block.strip() else _item_to_text_blob(item)
-
 
 def _rows_from_csv(path: str) -> List[Dict]:
     """Read one CSV and map rows into dicts with best-guess Q/A fields."""
@@ -135,23 +156,18 @@ def _rows_from_csv(path: str) -> List[Dict]:
     a_col = CSV_A_COL.lower() if CSV_A_COL else None
 
     if not q_col:
-        for cand in ["question", "q", "prompt", "title", "query", "input"]:
-            if cand in df.columns:
-                q_col = cand
-                break
+        for cand in ["question","q","prompt","title","query","input"]:
+            if cand in df.columns: q_col = cand; break
     if not a_col:
-        for cand in ["answer", "a", "response", "content", "text", "reply", "output"]:
-            if cand in df.columns:
-                a_col = cand
-                break
+        for cand in ["answer","a","response","content","text","reply","output"]:
+            if cand in df.columns: a_col = cand; break
 
     rows: List[Dict] = []
     for _, r in df.iterrows():
         record: Dict = {}
         for c in df.columns:
             val = r.get(c)
-            if pd.isna(val):
-                continue
+            if pd.isna(val): continue
             record[c] = str(val)
         if q_col and q_col in df.columns:
             record.setdefault("question", str(r[q_col]))
@@ -160,15 +176,13 @@ def _rows_from_csv(path: str) -> List[Dict]:
         rows.append(record)
     return rows
 
-
 def load_dataset():
-    """Load dataset from DATA_PATH (single file) or DATA_GLOB (many CSVs), then build TF-IDF index."""
+    """Load dataset from DATA_PATH (single) or DATA_GLOB (many CSVs), then build TF-IDF index."""
     global _vectorizer, _matrix, _raw_items, _display_blobs
 
     items: List[Dict] = []
 
     if DATA_PATH:
-        # Single file mode
         p = DATA_PATH
         if p.lower().endswith(".json"):
             try:
@@ -188,7 +202,6 @@ def load_dataset():
         else:
             print(f"[WARN] Unsupported DATA_PATH extension: {p}")
     else:
-        # Multi-file CSV mode
         paths = sorted(glob.glob(DATA_GLOB))
         if not paths:
             print(f"[INFO] No CSV files matched {DATA_GLOB}. Running pure Gemini mode.")
@@ -219,7 +232,6 @@ def load_dataset():
 # Build index on startup
 load_dataset()
 
-
 # =========================
 # Retrieval + chat helpers
 # =========================
@@ -234,7 +246,6 @@ def retrieve_top_k(query: str, k: int) -> List[Tuple[int, float]]:
     idxs = sims.argsort()[::-1][:k]
     return [(int(i), float(sims[i])) for i in idxs]
 
-
 # =========================
 # Routes
 # =========================
@@ -242,15 +253,17 @@ def retrieve_top_k(query: str, k: int) -> List[Tuple[int, float]]:
 def index():
     return render_template("index.html")
 
-
 @app.route("/chat", methods=["POST"])
 def chat():
     user_message = request.json.get("message", "").strip()
     if not user_message:
         return jsonify({"response": "Please type a message."}), 400
 
-    # Detect user language with confidence; default to English on low confidence
-    user_lang = detect_lang_confident(user_message, default="en", min_conf=0.80)
+    # Language handling (heuristics-first)
+    if looks_english(user_message):
+        user_lang = "en"
+    else:
+        user_lang = detect_lang_confident(user_message, default="en", min_conf=MIN_DETECT_CONF)
 
     # For retrieval, translate to English only if confidently non-English
     user_message_en = user_message if user_lang == "en" else translate(user_message, src_lang=user_lang, dest_lang="en")
@@ -264,7 +277,7 @@ def chat():
     use_dataset = len(valid_pairs) > 0
 
     if use_dataset:
-        # Build CONTEXT from valid matches (these are English snippets)
+        # Build CONTEXT from valid matches (English snippets)
         context_blocks = [_display_blobs[idx] for idx, _ in valid_pairs]
         context_text_en = "\n\n---\n\n".join([b for b in context_blocks if b.strip()])
 
@@ -280,9 +293,14 @@ def chat():
             response = chat_session.send_message(grounded_prompt_en)
             bot_reply_en = getattr(response, "text", "") or ""
         except Exception as e:
-            bot_reply_en = f"Error: {e}"
+            # Graceful handling (e.g., quota 429)
+            msg = str(e)
+            if "429" in msg or "quota" in msg.lower():
+                bot_reply_en = "I'm temporarily over my request limit. Please try again later."
+            else:
+                bot_reply_en = f"Error: {e}"
 
-        # If dataset-based reply still doesn't answer, fall back to open Gemini
+        # If dataset-based reply still doesn't answer, fall back to open model
         normalized = bot_reply_en.lower().strip()
         if (
             "i don't know based on the provided data" in normalized
@@ -293,47 +311,48 @@ def chat():
                 response2 = chat_session.send_message(user_message_en)
                 gen_reply_en = getattr(response2, "text", "") or "Sorry, I couldn't generate a response."
             except Exception as e:
-                gen_reply_en = f"Error: {e}"
-            prefix_local = translate(FALLBACK_PREFIX, src_lang="en", dest_lang=user_lang)
-            bot_reply = f"{prefix_local}\n\n{translate(gen_reply_en, src_lang='en', dest_lang=user_lang)}"
+                msg = str(e)
+                if "429" in msg or "quota" in msg.lower():
+                    gen_reply_en = "I'm temporarily over my request limit. Please try again later."
+                else:
+                    gen_reply_en = f"Error: {e}"
+            # No prefix, no “Gemini” signature
+            bot_reply = gen_reply_en if user_lang == "en" else translate(gen_reply_en, src_lang="en", dest_lang=user_lang)
         else:
             # Translate final dataset-grounded answer back to the user's language
-            bot_reply = translate(bot_reply_en, src_lang="en", dest_lang=user_lang)
+            bot_reply = bot_reply_en if user_lang == "en" else translate(bot_reply_en, src_lang="en", dest_lang=user_lang)
 
     else:
-        # Fallback to open Gemini answer (still keep memory)
+        # No good matches → fallback to open model (English), then translate back
         try:
             chat_session = model.start_chat(history=history)
             response = chat_session.send_message(user_message_en)
             gen_reply_en = getattr(response, "text", None) or "Sorry, I couldn't generate a response."
         except Exception as e:
-            gen_reply_en = f"Error: {e}"
+            msg = str(e)
+            if "429" in msg or "quota" in msg.lower():
+                gen_reply_en = "I'm temporarily over my request limit. Please try again later."
+            else:
+                gen_reply_en = f"Error: {e}"
 
-        # Translate back to user language
-        gen_reply_local = translate(gen_reply_en, src_lang="en", dest_lang=user_lang)
+        # No prefix, no “Gemini” signature
+        bot_reply = gen_reply_en if user_lang == "en" else translate(gen_reply_en, src_lang="en", dest_lang=user_lang)
 
-        # Append signature instead of prefix
-        bot_reply = f"{gen_reply_local}"
-
-
-    # Update session history (store the original user message and the localized reply)
+    # Update session history (store original message + localized reply)
     history.append({"role": "user", "parts": [user_message]})
     history.append({"role": "model", "parts": [bot_reply]})
     session["history"] = history[-MAX_HISTORY:]
 
     return jsonify({"response": bot_reply})
 
-
 @app.route("/reset", methods=["POST"])
 def reset():
     session["history"] = []
     return jsonify({"ok": True})
 
-
 @app.route("/healthz")
 def healthz():
     return "ok", 200
-
 
 if __name__ == "__main__":
     # For local debugging; Heroku will use gunicorn via Procfile
