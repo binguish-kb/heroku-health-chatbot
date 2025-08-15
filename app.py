@@ -281,10 +281,10 @@ def chat():
         context_blocks = [_display_blobs[idx] for idx, _ in valid_pairs]
         context_text_en = "\n\n---\n\n".join([b for b in context_blocks if b.strip()])
 
-        system_hint = (
-            "You are a helpful health assistant. Answer the user using ONLY the information in the CONTEXT. "
-            "If the answer is not in the CONTEXT, say: 'I don't know based on the provided data.' "
-            "Do not fabricate details."
+        system_hint = ("You are a helpful health information assistant. Use ONLY the information in CONTEXT when provided. "
+            "Provide general information, practical self-care steps, and clear red-flag symptoms that require urgent care. "
+            "Be supportive and concise. If something is not in the CONTEXT, say: 'I don't know based on the provided data.' "
+            "Regardless of how the user writes, structure your response with: brief summary, suggested steps, and red flags. "
         )
         grounded_prompt_en = f"{system_hint}\n\nCONTEXT:\n{context_text_en}\n\nUser: {user_message_en}\nAnswer:"
 
@@ -343,7 +343,10 @@ def chat():
     history.append({"role": "model", "parts": [bot_reply]})
     session["history"] = history[-MAX_HISTORY:]
 
-    return jsonify({"response": bot_reply})
+    # Always return in user's language; translate only if needed
+    final_reply = bot_reply if user_lang == "en" else translate(bot_reply, src_lang="en", dest_lang=user_lang)
+    return jsonify({"response": final_reply})
+
 
 @app.route("/reset", methods=["POST"])
 def reset():
