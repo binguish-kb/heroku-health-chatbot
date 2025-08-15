@@ -24,21 +24,34 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 SECRET_KEY = os.getenv("SECRET_KEY")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))  # total messages kept (user+bot), 10 ~= last 5 exchanges
 
-def detect_lang(text: str, default="en") -> str:
+TRANSLATION_ENABLED = os.getenv("TRANSLATION_ENABLED", "true").lower() in {"1","true","yes","on"}
+
+def detect_lang_confident(text: str, default="en", min_conf=0.80) -> str:
+    """Return ISO lang code if confident, else default ('en')."""
     try:
-        lang = detect(text)
-        return lang or default
+        # detect_langs returns list like ['en:0.99','es:0.01']
+        langs = detect_langs(text)
+        if not langs:
+            return default
+        top = langs[0]
+        # langdetect’s object formats like: Lang('en', 0.9999)
+        lang = top.lang
+        prob = getattr(top, 'prob', 0.0)
+        if lang == "en":
+            return "en"
+        return lang if prob >= min_conf else default
     except Exception:
         return default
 
 def translate(text: str, src_lang: str, dest_lang: str) -> str:
-    if not text or src_lang == dest_lang:
+    if not TRANSLATION_ENABLED or not text or src_lang == dest_lang:
         return text
     try:
         return GoogleTranslator(source=src_lang, target=dest_lang).translate(text)
     except Exception:
-        # If translation fails, just return original so the app still replies
+        # If translation fails, return original so the bot still replies
         return text
+
         
 # Retrieval settings
 K = int(os.getenv("K", "3"))  # how many top items to include as context
@@ -236,11 +249,11 @@ def chat():
     if not user_message:
         return jsonify({"response": "Please type a message."}), 400
 
-    # Detect user language (default English)
-    user_lang = detect_lang(user_message, default="en")
+    # Detect user language with confidence; default to English on low confidence
+    user_lang = detect_lang_confident(user_message, default="en", min_conf=0.80)
 
-    # Translate user message to English for retrieval (assuming your CSVs are English)
-    user_message_en = translate(user_message, src_lang=user_lang, dest_lang="en")
+    # For retrieval, translate to English only if confidently non-English
+    user_message_en = user_message if user_lang == "en" else translate(user_message, src_lang=user_lang, dest_lang="en")
 
     # Short-term history from session
     history = session.get("history", [])
