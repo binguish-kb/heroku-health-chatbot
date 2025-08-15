@@ -300,7 +300,7 @@ def chat():
         gen_reply_local = translate(gen_reply_en, src_lang="en", dest_lang=user_lang)
 
         # Append signature instead of prefix
-        bot_reply = f"{gen_reply_local}\n\n– Gemini"
+        bot_reply = f"{gen_reply_local}"
 
 
     # Update session history (store the original user message and the localized reply)
