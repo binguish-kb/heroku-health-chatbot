@@ -40,7 +40,7 @@ MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 K        = int(os.getenv("K", "3"))
 MIN_SIM  = float(os.getenv("MIN_SIM", "0.12"))
 
-# Dataset
+# Dataset (optional CSVs for grounding)
 DATA_GLOB = os.getenv("DATA_GLOB", "*.csv")
 DATA_PATH = os.getenv("DATA_PATH", "")
 CSV_Q_COL = os.getenv("CSV_Q_COL", "")
@@ -118,57 +118,7 @@ def translate(text: str, src_lang: str, dest_lang: str) -> str:
         return text
 
 # =========================
-# Prompting helpers
-# =========================
-SYSTEM_CORE = (
-    "You are a careful, supportive health information assistant.\n"
-    "Provide general, educational guidance the user can apply now. Be specific and actionable.\n"
-    "Use a calm, reassuring tone. Do not diagnose diseases or claim to be a clinician.\n"
-    "NEVER say 'I am an AI' or give generic boilerplate disclaimers.\n"
-    "If important info is missing, begin with 2–4 targeted follow-up questions before guidance.\n"
-    "If the user's name is known, address them once naturally at the start.\n"
-    "Structure EVERY answer with these sections:\n"
-    "1) Summary — 1–2 sentences restating the concern.\n"
-    "2) What it might be — general possibilities (not a diagnosis).\n"
-    "3) Clinical reasoning outline — factors that make options more/less likely; what else to ask/check; simple risk signals.\n"
-    "4) What you can do now — concrete self-care (non-drug first; dosing ranges if appropriate; metric units; hygiene/isolation when relevant).\n"
-    "5) When to see a professional — routine triggers (e.g., >48–72h, worsening, special populations).\n"
-    "6) Red flags — urgent symptoms requiring immediate/urgent care.\n"
-)
-
-def build_system_hint(lang_code: str, name: str = "") -> str:
-    name_line = f"If a name is available (e.g., '{name}'), greet them once." if name else "Greet the user once without a name if unknown."
-    return (
-        SYSTEM_CORE +
-        f"\nAlways answer in language code '{lang_code}'. "
-        "Be concise but complete. Avoid generic apologies.\n" +
-        name_line
-    )
-
-GENERIC_MARKERS = [
-    "i am an ai", "i'm an ai", "cannot give medical advice",
-    "consult a doctor", "consult your doctor", "seek medical attention",
-    "as an ai", "i cannot provide medical advice"
-]
-
-def looks_generic(text: str) -> bool:
-    if not text:
-        return True
-    t = text.lower().strip()
-    if len(t) < 20:
-        return True
-    return any(m in t for m in GENERIC_MARKERS)
-
-def build_grounded_prompt(context_text_en: str, user_message_en: str, lang: str, name: str) -> str:
-    system_hint = build_system_hint(lang, name)
-    return f"{system_hint}\n\nCONTEXT:\n{context_text_en}\n\nUser: {user_message_en}\nAnswer:"
-
-def build_open_prompt(user_message_en: str, lang: str, name: str) -> str:
-    system_hint = build_system_hint(lang, name)
-    return f"{system_hint}\n\nUser: {user_message_en}\nAnswer:"
-
-# =========================
-# Dataset shaping
+# Dataset shaping (optional grounding)
 # =========================
 def _item_to_text_blob(item: Dict) -> str:
     if isinstance(item, dict):
@@ -248,8 +198,6 @@ def load_dataset():
             print(f"[WARN] Unsupported DATA_PATH: {p}")
     else:
         paths = sorted(glob.glob(DATA_GLOB))
-        if not paths:
-            print(f"[INFO] No CSV files matched {DATA_GLOB}. Running pure Gemini mode.")
         for p in paths:
             try:
                 items.extend(_rows_from_csv(p))
@@ -266,7 +214,7 @@ def load_dataset():
         print(f"[INFO] Indexed {len(corpus)} items.")
     else:
         _vectorizer, _matrix = None, None
-        print("[INFO] No dataset items loaded; fallback to pure Gemini.")
+        print("[INFO] No dataset items loaded; pure Gemini fallback.")
 
 load_dataset()
 
@@ -365,20 +313,6 @@ def verify_user(user_id: str, dob: str) -> bool:
     u = get_user_by_id(user_id)
     return bool(u and (u.get("dob") or "") == dob.strip())
 
-def set_memory(user_id: str, key: str, value: str):
-    with db() as conn:
-        conn.execute("""
-            INSERT INTO memories(user_id,key,value,updated_at)
-            VALUES (?,?,?,?)
-            ON CONFLICT(user_id,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-        """, (user_id, key, value, datetime.utcnow().isoformat()))
-        conn.commit()
-
-def get_memory(user_id: str, key: str) -> str:
-    with db() as conn:
-        r = conn.execute("SELECT value FROM memories WHERE user_id=? AND key=?", (user_id, key)).fetchone()
-        return r["value"] if r else ""
-
 def purge_old_journal(user_id: str):
     cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
     with db() as conn:
@@ -468,6 +402,119 @@ def wants_week_summary(msg: str) -> bool:
     return any(re.search(p, s) for p in SUMMARY_PATTERNS)
 
 # =========================
+# Lightweight intent & risk classifier (via Gemini, JSON only)
+# =========================
+CLASSIFIER_SYS = (
+    "You classify a short user message. Return compact JSON only.\n"
+    "Fields:\n"
+    '- intent: one of ["smalltalk","medical","nonmedical"]\n'
+    '- risk: one of ["emergency","urgent","routine","unknown"]\n'
+    '- info_level: one of ["low","medium","high"]  # how much health detail is present\n'
+    "Rules:\n"
+    "- Greetings/thanks/\"help?\" => smalltalk.\n"
+    "- If the message asks for general knowledge, coding, homework, shopping, etc. => nonmedical.\n"
+    "- If any health symptoms, meds, body parts, duration, vitals, etc. => medical.\n"
+    "JSON only, no prose."
+)
+
+def classify_intent_and_risk(text_en: str) -> Dict:
+    try:
+        chat = model.start_chat(history=[])
+        resp = chat.send_message(f"{CLASSIFIER_SYS}\n\nText: {text_en}")
+        raw = getattr(resp, "text", "") or "{}"
+        # be forgiving on trailing text
+        jstart = raw.find("{")
+        jend = raw.rfind("}")
+        parsed = json.loads(raw[jstart:jend+1]) if (jstart != -1 and jend != -1) else {}
+        intent = parsed.get("intent", "unknown")
+        risk = parsed.get("risk", "unknown")
+        info_level = parsed.get("info_level", "low")
+        return {"intent": intent, "risk": risk, "info_level": info_level}
+    except Exception:
+        return {"intent": "unknown", "risk": "unknown", "info_level": "low"}
+
+# =========================
+# Prompt builders for generation
+# =========================
+SYSTEM_CORE = (
+    "You are a friendly, supportive assistant focused on health.\n"
+    "Speak naturally, like a helpful friend—warm, brief when appropriate.\n"
+    "Do not diagnose diseases or claim to be a clinician.\n"
+    "Never say 'I am an AI' or give generic boilerplate disclaimers.\n"
+)
+
+def syslock(lang: str, name: str = "") -> str:
+    name_line = f"If a name is available (e.g., '{name}'), greet them once." if name else "Greet the user once without a name if unknown."
+    return (
+        SYSTEM_CORE +
+        f"Always answer in language code '{lang}'. " +
+        name_line
+    )
+
+def prompt_smalltalk(user_en: str, lang: str, name: str) -> str:
+    return (
+        f"{syslock(lang, name)}\n"
+        "Task: The user is making small talk or a vague greeting. "
+        "Respond briefly (1–2 short lines), friendly and open-ended. "
+        "Invite them to share what's going on health-wise.\n"
+        f"User: {user_en}\nAnswer:"
+    )
+
+def prompt_scope_limit(user_en: str, lang: str, name: str) -> str:
+    return (
+        f"{syslock(lang, name)}\n"
+        "Task: The user asked something non-medical. "
+        "Respond in one short friendly line explaining you can only help with medical/health topics, "
+        "and invite them to share any health concerns.\n"
+        f"User: {user_en}\nAnswer:"
+    )
+
+def prompt_triage_only(user_en: str, lang: str, name: str) -> str:
+    return (
+        f"{syslock(lang, name)}\n"
+        "Task: The user mentioned health but gave very little detail. "
+        "Ask EXACTLY 3 concise triage questions (numbered 1–3) tailored to their message. "
+        "No extra text.\n"
+        f"User: {user_en}\nAnswer:"
+    )
+
+STRUCTURE_LONG = (
+    "Structure with these headings:\n"
+    "1) Summary — 1–2 sentences restating the concern.\n"
+    "2) What it might be — general possibilities (not a diagnosis).\n"
+    "3) Clinical reasoning outline — factors that make options more/less likely; what else to ask/check; simple risk signals.\n"
+    "4) What you can do now — concrete self-care (non-drug first; dosing ranges if appropriate; metric units; hygiene/isolation when relevant).\n"
+    "5) When to see a professional — routine triggers (e.g., >48–72h, worsening, special populations).\n"
+    "6) Red flags — urgent symptoms requiring immediate/urgent care.\n"
+    "Keep it crisp; avoid fluff."
+)
+
+def prompt_structured(user_en: str, lang: str, name: str, context_en: str = "") -> str:
+    ctx = f"\n\nCONTEXT:\n{context_en}\n" if context_en.strip() else "\n"
+    return (
+        f"{syslock(lang, name)}\n"
+        "Task: Provide a structured, practical health answer. "
+        f"{STRUCTURE_LONG}"
+        f"{ctx}"
+        f"User: {user_en}\nAnswer:"
+    )
+
+def prompt_compact(user_en: str, lang: str, name: str, context_en: str = "") -> str:
+    ctx = f"\n\nCONTEXT:\n{context_en}\n" if context_en.strip() else "\n"
+    return (
+        f"{syslock(lang, name)}\n"
+        "Task: Provide a compact medical answer for a routine/non-urgent issue. "
+        "Format:\n"
+        "- Brief summary (1 line)\n"
+        "- 3–5 self-care steps\n"
+        "- When to seek care (3 bullet points)\n"
+        "- 2–3 red flags\n"
+        "No long sections; be concise.\n"
+        f"{ctx}"
+        f"User: {user_en}\nAnswer:"
+    )
+
+# =========================
 # Onboarding
 # =========================
 def start_onboarding():
@@ -502,7 +549,7 @@ def handle_onboarding(user_text: str) -> str:
             session.pop("onboarding_stage", None)
             u = get_user_by_id(uid) or {}
             name = u.get("name") or ""
-            return f"Welcome back{', ' + name if name else ''}! Your journal will be saved automatically."
+            return f"Welcome back{', ' + name if name else ''}! I’ll save your journal automatically."
         else:
             session.pop("temp_user_id", None)
             session["onboarding_stage"] = "ask_existing"
@@ -551,11 +598,7 @@ def export_journal():
 
 @app.route("/reset", methods=["POST"])
 def reset():
-    session["history"] = []
-    session.pop("user_id", None)
-    session.pop("onboarding_stage", None)
-    session.pop("temp_user_id", None)
-    session.pop("new_name", None)
+    session.clear()
     return jsonify({"ok": True})
 
 @app.route("/healthz")
@@ -568,7 +611,7 @@ def chat():
     if not user_message:
         return jsonify({"response": "Please type a message."}), 400
 
-    # Onboarding if needed
+    # Onboarding
     if "user_id" not in session:
         if session.get("onboarding_stage"):
             reply = handle_onboarding(user_message)
@@ -582,40 +625,14 @@ def chat():
     # Weekly cleanup
     purge_old_journal(user_id)
 
-    # Language
+    # Language + canonical English copy
     if looks_english(user_message):
         user_lang = "en"
     else:
         user_lang = detect_lang_confident(user_message, default="en", min_conf=MIN_DETECT_CONF)
     user_message_en = user_message if user_lang == "en" else translate(user_message, src_lang=user_lang, dest_lang="en")
 
-    # Crisis detection
-    crisis_prefix = ""
-    if detect_crisis(user_message_en):
-        crisis_prefix = supportive_resources(user_lang) + "\n\n"
-        if not (urec.get("emergency_contact") or "").strip():
-            crisis_prefix += "If you’d like, share an emergency contact (e.g., “My emergency contact is Sam, +61…”) and I’ll save it.\n\n"
-
-    # Friendly natural emergency contact set/clear
-    m_set = EMERGENCY_SET_PAT.search(user_message)
-    if m_set:
-        ec = m_set.group(1).strip()
-        with db() as conn:
-            conn.execute("UPDATE users SET emergency_contact=? WHERE id=?", (ec, user_id))
-            conn.commit()
-        ack = "Emergency contact saved."
-        ack = ack if user_lang == "en" else translate(ack, "en", user_lang)
-        # Journal the message then continue with health answer as usual
-    elif EMERGENCY_CLEAR_PAT.search(user_message):
-        with db() as conn:
-            conn.execute("UPDATE users SET emergency_contact='' WHERE id=?", (user_id,))
-            conn.commit()
-        ack = "Emergency contact removed."
-        ack = ack if user_lang == "en" else translate(ack, "en", user_lang)
-    else:
-        ack = ""
-
-    # Always JOURNAL user input (original + English)
+    # Always JOURNAL user input
     add_journal_entry(
         user_id=user_id,
         lang=user_lang,
@@ -623,7 +640,7 @@ def chat():
         text_en=user_message_en
     )
 
-    # Natural “export my journal”
+    # Natural intents: export / weekly summary / emergency contact
     if wants_export(user_message):
         with db() as conn:
             rows = conn.execute("""
@@ -637,18 +654,12 @@ def chat():
         for r in rows:
             writer.writerow([r["id"], r["ts"], r["lang"], r["text_original"], r["text_en"], r["tags"], r["mood"]])
         csv_text = buf.getvalue()
-        resp_msg = ("I’ve prepared your journal CSV below. "
-                    "You can also POST to /journal/export to fetch it again.\n\n") + csv_text
-        if crisis_prefix:
-            resp_msg = crisis_prefix + resp_msg
-        if ack:
-            resp_msg = ack + "\n\n" + resp_msg
-        # Log and return
+        reply = "Here’s your journal CSV. You can POST to /journal/export to fetch it again.\n\n" + csv_text
+        reply = reply if user_lang == "en" else translate(reply, "en", user_lang)
         log_conversation(user_id, "user", user_message_en)
-        log_conversation(user_id, "assistant", resp_msg if user_lang=="en" else translate(resp_msg,"en",user_lang))
-        return jsonify({"response": resp_msg})
+        log_conversation(user_id, "assistant", reply if user_lang=="en" else translate(reply, user_lang, "en"))
+        return jsonify({"response": reply})
 
-    # Natural “summarize my week”
     if wants_week_summary(user_message):
         with db() as conn:
             since = (datetime.utcnow() - timedelta(days=7)).isoformat()
@@ -664,90 +675,112 @@ def chat():
             chat_session = model.start_chat(history=[])
             resp = chat_session.send_message(f"{sys}\n\nEntries (English):\n{corpus}\n\nWrite the reflection now in {user_lang}.")
             weekly = getattr(resp, "text", "") or "I couldn’t produce a summary this time."
-            out = ("Weekly reflection:\n" + weekly)
-            if crisis_prefix:
-                out = crisis_prefix + out
-            if ack:
-                out = ack + "\n\n" + out
-            # Log and return
+            out = "Weekly reflection:\n" + weekly
+            out = out if user_lang == "en" else translate(out, "en", user_lang)
             log_conversation(user_id, "user", user_message_en)
-            log_conversation(user_id, "assistant", out if user_lang=="en" else translate(out,"en",user_lang))
+            log_conversation(user_id, "assistant", out if user_lang=="en" else translate(out, user_lang, "en"))
             return jsonify({"response": out})
 
-    # ===== Health assistant (default) =====
-    prior = last_n_conversation(user_id, n=6)
-    if prior:
-        user_message_en = f"(Previous context)\n{prior}\n\n(Current)\n{user_message_en}"
+    # Emergency contact set/clear (natural language)
+    m_set = EMERGENCY_SET_PAT.search(user_message)
+    m_clr = EMERGENCY_CLEAR_PAT.search(user_message)
+    ack = ""
+    if m_set:
+        ec = m_set.group(1).strip()
+        with db() as conn:
+            conn.execute("UPDATE users SET emergency_contact=? WHERE id=?", (ec, user_id))
+            conn.commit()
+        ack = "Emergency contact saved."
+    elif m_clr:
+        with db() as conn:
+            conn.execute("UPDATE users SET emergency_contact='' WHERE id=?", (user_id,))
+            conn.commit()
+        ack = "Emergency contact removed."
+    if ack:
+        ack = ack if user_lang == "en" else translate(ack, "en", user_lang)
 
-    pairs = retrieve_top_k(user_message_en, K)
-    valid_pairs = [(i, s) for (i, s) in pairs if s >= MIN_SIM]
-    use_dataset = len(valid_pairs) > 0
-    history = session.get("history", [])
+    # Crisis detection
+    crisis_prefix = ""
+    if detect_crisis(user_message_en):
+        crisis_prefix = supportive_resources(user_lang) + "\n\n"
+        if not (urec.get("emergency_contact") or "").strip():
+            crisis_prefix += "If you’d like, share an emergency contact (e.g., “My emergency contact is Sam, +61…”) and I’ll save it.\n\n"
 
-    if use_dataset:
-        context_blocks = [_display_blobs[idx] for idx, _ in valid_pairs]
-        context_text_en = "\n\n---\n\n".join([b for b in context_blocks if b.strip()])
-        grounded_prompt_en = build_grounded_prompt(context_text_en, user_message_en, user_lang, user_name)
-        try:
-            chat_session = model.start_chat(history=history)
-            response = chat_session.send_message(grounded_prompt_en)
-            bot_reply_candidate = getattr(response, "text", "") or ""
-        except Exception as e:
-            msg = str(e)
-            bot_reply_candidate = "Temporary rate limit. Please try again in a moment." if ("429" in msg or "quota" in msg.lower()) else f"Error: {e}"
-        if looks_generic(bot_reply_candidate):
-            try:
-                chat_session = model.start_chat(history=history)
-                response2 = chat_session.send_message(
-                    grounded_prompt_en + "\n\nIMPORTANT: Avoid generic disclaimers. Provide specific steps and red flags tailored to the scenario."
-                )
-                bot_reply_candidate2 = getattr(response2, "text", "") or ""
-                if not looks_generic(bot_reply_candidate2):
-                    bot_reply_candidate = bot_reply_candidate2
-            except Exception:
-                pass
-        bot_reply = bot_reply_candidate
-        bot_reply_lang = user_lang
+    # Lightweight intent/risk classification
+    cls = classify_intent_and_risk(user_message_en)
+    intent = cls["intent"]
+    risk = cls["risk"]
+    info_level = cls["info_level"]
+
+    # Small talk: friendly, short
+    if intent == "smalltalk":
+        prompt = prompt_smalltalk(user_message_en, user_lang, user_name)
+        chat_session = model.start_chat(history=[])
+        resp = chat_session.send_message(prompt)
+        answer = getattr(resp, "text", "") or "Hi! What’s on your mind health-wise?"
+        out = answer
+
+    # Non-medical: short scope message
+    elif intent == "nonmedical":
+        prompt = prompt_scope_limit(user_message_en, user_lang, user_name)
+        chat_session = model.start_chat(history=[])
+        resp = chat_session.send_message(prompt)
+        answer = getattr(resp, "text", "") or "I can only help with medical or health topics. Tell me what’s going on and I’ll do my best."
+        out = answer
+
+    # Medical: choose style based on risk/info
     else:
-        open_prompt_en = build_open_prompt(user_message_en, user_lang, user_name)
-        try:
-            chat_session = model.start_chat(history=history)
-            response = chat_session.send_message(open_prompt_en)
-            bot_reply_candidate = getattr(response, "text", None) or ""
-        except Exception as e:
-            msg = str(e)
-            bot_reply_candidate = "Temporary rate limit. Please try again in a moment." if ("429" in msg or "quota" in msg.lower()) else f"Error: {e}"
-        if looks_generic(bot_reply_candidate):
-            try:
-                chat_session = model.start_chat(history=history)
-                response2 = chat_session.send_message(
-                    open_prompt_en + "\n\nIMPORTANT: Avoid generic disclaimers. Provide specific, step-by-step self-care advice and clear thresholds for seeking care."
-                )
-                bot_reply_candidate2 = getattr(response2, "text", "") or ""
-                if not looks_generic(bot_reply_candidate2):
-                    bot_reply_candidate = bot_reply_candidate2
-            except Exception:
-                pass
-        bot_reply = bot_reply_candidate
-        bot_reply_lang = user_lang
+        # Add brief personalization context
+        prior = last_n_conversation(user_id, n=6)
+        if prior:
+            user_message_en = f"(Previous context)\n{prior}\n\n(Current)\n{user_message_en}"
 
-    # Update short session history for Gemini continuity
+        # Optional dataset grounding
+        pairs = retrieve_top_k(user_message_en, K)
+        valid_pairs = [(i, s) for (i, s) in pairs if s >= MIN_SIM]
+        context_en = ""
+        if valid_pairs:
+            context_blocks = [_display_blobs[idx] for idx, _ in valid_pairs]
+            context_en = "\n\n---\n\n".join([b for b in context_blocks if b.strip()])
+
+        long_needed = (risk in ("emergency","urgent")) or (info_level == "high") or (len(user_message_en) > 160)
+        triage_only = (info_level == "low") and (risk not in ("emergency","urgent"))
+
+        if triage_only:
+            prompt = prompt_triage_only(user_message_en, user_lang, user_name)
+        elif long_needed:
+            prompt = prompt_structured(user_message_en, user_lang, user_name, context_en)
+        else:
+            prompt = prompt_compact(user_message_en, user_lang, user_name, context_en)
+
+        chat_session = model.start_chat(history=[])
+        resp = chat_session.send_message(prompt)
+        answer = getattr(resp, "text", "") or ""
+        # Fallback if empty
+        if not answer.strip():
+            prompt2 = prompt_compact(user_message_en, user_lang, user_name, context_en)
+            resp2 = chat_session.send_message(prompt2)
+            answer = getattr(resp2, "text", "") or "Could you share a bit more about your symptoms?"
+
+        out = answer
+
+    # Add crisis prefix and any ack
+    if crisis_prefix:
+        out = crisis_prefix + out
+    if ack:
+        out = ack + "\n\n" + out
+
+    # Keep short local history for Gemini continuity (doesn't affect journaling)
+    history = session.get("history", [])
     history.append({"role": "user", "parts": [user_message]})
-    history.append({"role": "model", "parts": [bot_reply]})
+    history.append({"role": "model", "parts": [out]})
     session["history"] = history[-MAX_HISTORY:]
 
-    # Final localization
-    final_reply = bot_reply if bot_reply_lang == user_lang else translate(bot_reply, src_lang=bot_reply_lang, dest_lang=user_lang)
-    if crisis_prefix:
-        final_reply = crisis_prefix + final_reply
-    if ack:
-        final_reply = ack + "\n\n" + final_reply
-
-    # Persist conversation (English) for personalization
+    # Persist conversation in English for personalization
     log_conversation(user_id, "user", user_message if user_lang=="en" else translate(user_message, user_lang, "en"))
-    log_conversation(user_id, "assistant", final_reply if user_lang=="en" else translate(final_reply, user_lang, "en"))
+    log_conversation(user_id, "assistant", out if user_lang=="en" else translate(out, user_lang, "en"))
 
-    return jsonify({"response": final_reply})
+    return jsonify({"response": out})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
