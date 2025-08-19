@@ -41,17 +41,28 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 # app.config["SESSION_COOKIE_SECURE"] = True
 
 # ---------- Database ----------
+# ---------- Database ----------
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
+
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///chatbot.db")
-engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+
+# If on Heroku Postgres, require SSL without changing DATABASE_URL
+connect_args = {}
+if DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://"):
+    # psycopg2 respects 'sslmode' via connect args
+    connect_args = {"sslmode": "require"}
+
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_pre_ping=True,
+    connect_args=connect_args
+)
+
 Base = declarative_base()
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
-
-class Conversation(Base):
-    __tablename__ = "conversations"
-    user_id = Column(String, primary_key=True)
-    history = Column(Text)  # JSON: [{"role": "user"|"assistant", "content": "..."}]
-
-Base.metadata.create_all(engine)
 
 # ---------- Helpers ----------
 def _normalize_history(history_list):
