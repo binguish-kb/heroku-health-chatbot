@@ -1,8 +1,7 @@
-flask
-google-generativeai
-gunicorn
-numpy
-scikit-learn
-pandas
-langdetect
-deep-translator
+Flask>=3.0
+gunicorn>=22.0
+Flask-Cors>=4.0
+google-generativeai>=0.7.0
+python-dotenv>=1.0
+SQLAlchemy>=2.0
+psycopg2-binary>=2.9
