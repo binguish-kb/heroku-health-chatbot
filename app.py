@@ -235,8 +235,8 @@ def chat():
         context_text = "\n\n---\n\n".join([b for b in context_blocks if b.strip()])
 
         system_hint = (
-            "You are a helpful assistant. Answer the user using ONLY the information in the CONTEXT. "
-            "If the answer is not in the CONTEXT, say: 'I don't know based on the provided data.' "
+            "You are a helpful health assistant. Answer the user using ONLY the information in the CONTEXT. "
+            
             "Do not fabricate details."
         )
         grounded_prompt = f"{system_hint}\n\nCONTEXT:\n{context_text}\n\nUser: {user_message}\nAnswer:"
