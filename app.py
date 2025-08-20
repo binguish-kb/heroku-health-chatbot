@@ -255,7 +255,7 @@ def chat():
             gen_reply = getattr(response, "text", None) or "Sorry, I couldn't generate a response."
         except Exception as e:
             gen_reply = f"Error: {e}"
-        bot_reply = f"{FALLBACK_PREFIX}\n\n{gen_reply}"
+        bot_reply = f"{gen_reply}"
 
     # Update session history (trim to last N messages)
     history.append({"role": "user", "parts": [user_message]})
