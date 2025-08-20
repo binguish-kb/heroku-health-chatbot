@@ -82,8 +82,8 @@ def _item_to_context_block(item: Dict) -> str:
     """Human-readable block that we show Gemini as CONTEXT."""
     if not isinstance(item, dict):
         return str(item)
-    q = item.get("question") or item.get("q") or item.get("prompt") or item.get("title") or ""
-    a = item.get("answer") or item.get("a") or item.get("response") or item.get("content") or item.get("text") or ""
+    q = item.get("input") or item.get("q") or item.get("prompt") or item.get("title") or ""
+    a = item.get("output") or item.get("a") or item.get("response") or item.get("content") or item.get("text") or ""
     ctx = item.get("context") or item.get("description") or ""
     lines = []
     if ctx:
@@ -235,8 +235,10 @@ def chat():
         context_text = "\n\n---\n\n".join([b for b in context_blocks if b.strip()])
 
         system_hint = (
-            "You are a helpful health assistant. Answer the user using ONLY the information in the CONTEXT. "
-            
+            "You are a helpful health assistant. Answer the user using the information in the CONTEXT."
+            "treat normal greetings as normal and respond them how you see fit"
+            "If the question is out of context and isn't a greeting but is related to health or medical condition in any way, give a proper answer to the user."
+            "If the question is out of context and isn't a greeting but isn't related to health or medical emergency in any way, give a generic short answer and prompt that you are just a health chatbot."            
             "Do not fabricate details."
         )
         grounded_prompt = f"{system_hint}\n\nCONTEXT:\n{context_text}\n\nUser: {user_message}\nAnswer:"
