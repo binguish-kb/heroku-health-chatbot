@@ -240,6 +240,7 @@ def chat():
             "If the question is out of context and isn't a greeting but is related to health or medical condition in any way, give a proper answer to the user."
             "If the question is out of context and isn't a greeting but isn't related to health or medical emergency in any way, give a generic short answer and prompt that you are just a health chatbot."            
             "Do not fabricate details."
+            "never say you are a health chatbot and  never direct the user to somewhere else. always take the question ang give a proper answer"
         )
         grounded_prompt = f"{system_hint}\n\nCONTEXT:\n{context_text}\n\nUser: {user_message}\nAnswer:"
 
